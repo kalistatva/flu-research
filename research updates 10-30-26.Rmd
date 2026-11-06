@@ -1,0 +1,150 @@
+---
+title: "research progress"
+author: "Nishorgo Sarkar"
+date: "2026-10-30"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### packages, data cleanup, and summaries
+
+```{r packages, message = FALSE}
+library(tidyverse)
+library(cowplot)
+library(ggthemes)
+library(fishualize)
+library(pracma)
+library(sf)
+library(tigris)
+library(tinytex)
+```
+
+```{r data-cleanup, echo = FALSE}
+# data import and cleanup ----
+flu_data <- read_csv("https://raw.githubusercontent.com/cdcepi/FluSight-forecast-hub/refs/heads/main/target-data/target-hospital-admissions.csv")
+flu_data_orig <- flu_data # original copy of data
+
+## function to assign season given date
+## seasons defined as epiweek 40 to epiweek 39 (roughly October to October)
+find_season <- function(date) {
+  date <- as.Date(date)
+  epiyr <- epiyear(date)
+  epiwk <- epiweek(date)
+  start_yr <- ifelse(epiwk >= 40, epiyr, epiyr - 1)
+  end_yr <- start_yr + 1
+  paste0(start_yr,"-",end_yr)
+}
+
+flu_data <- flu_data |>
+  mutate(date = as.Date(date), week = epiweek(date), year = epiyear(date), season = as.factor(find_season(date))) # adding columns for epiweek/epiyear
+
+# flu_data$season <- find_season(flu_data$date) # adding column for season
+# flu_data$season <- as.factor(flu_data$season)
+
+summary(flu_data$season)
+head(flu_data)
+```
+
+### choropleth maps (updated 10-30-26)
+```{r choropleths-1, include = FALSE}
+flu_maxes <- flu_data |>
+  group_by(location_name, season) |>
+  slice_max(weekly_rate) |>
+  relocate(location_name, location, season, date, weekly_rate, value)
+
+states_48 <- states(cb = TRUE) |>
+  filter(!STUSPS %in% c("AK", "HI", "PR", "GU", "VI", "AS", "MP"))
+
+seasons <- unique(flu_data$season)
+```
+
+
+```{r choropleths-2, echo = FALSE}
+peak_flu_choropleth <- function (given_season) {
+  date_lims = c(as.Date(paste0(substr(given_season, 1, 4), "-10-01")),
+              as.Date(paste0(substr(given_season, 6, 9), "-03-31")))
+   
+  flu_maxes_filtered <- flu_maxes |>
+    filter(location_name != "US", season == given_season) |>
+    rename(GEOID = location)
+  
+  flu_maxes_sf <- left_join(states_48, flu_maxes_filtered, by = "GEOID")
+  
+  choropleth_map <- ggplot(flu_maxes_sf, aes(fill = date)) +
+    geom_sf() +
+    coord_sf(datum = NA, xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE) +
+    scale_fill_viridis_c(trans = "date", # date transformation on date column
+                         limits = date_lims,
+                         labels = scales::label_date("%B %d"), # Month day format
+                         option = "viridis", 
+                         guide = guide_colorbar(barheight = unit(6, "cm"), reverse = TRUE),
+                         # extends colorbar to prevent overlapping, puts older at top
+                         breaks = seq(from = date_lims[1], 
+                                      to = date_lims[2], 
+                                      by = 14)) +
+    theme_classic() +
+    labs(title = paste("Peak Weekly Influenza Hospitalization Rate in", given_season), fill = "Date")
+  
+  return(choropleth_map)
+}
+
+choropleth_maps <- sapply(seasons[1:5], peak_flu_choropleth)
+choropleth_maps
+```
+
+### finding peaks by state/season (updated 10-30-26)
+
+While I just used `findpeaks(threshold = 1)` to try to identify peaks, I tried smoothing out the data using a LOESS regression model, setting the $\alpha = 0.3$.
+
+```{r loess}
+flu_loess <- flu_data |>
+  group_by(location_name, season) |>
+  arrange(date) |>
+  mutate(time_index = row_number(),
+         loess_smoothed = predict(loess(weekly_rate ~ time_index, 
+                                        span = 0.4, 
+                                        na.action = na.exclude))) |>
+  ungroup()
+
+get_peaks <- function(group_data, season_input) {
+  initial_peaks <- findpeaks(group_data, minpeakdistance = 4, threshold = 1)
+  peaks <- if (is.null(initial_peaks)) {matrix(data = NA_real_, ncol = 4)} else {initial_peaks}
+  
+  dates_in_order <- flu_data |>
+    filter(season == season_input) |>
+    select(date) |> unique() |> as.matrix() |> sort()
+  
+  peaks[,2] <- dates_in_order[peaks[,2]]
+  peaks[,3] <- dates_in_order[peaks[,3]]
+  peaks[,4] <- dates_in_order[peaks[,4]]
+  
+  return(peaks)
+}
+
+state_peaks <- flu_loess|>
+  filter(!season %in% c("2021-2022", "2026-2027")) |>
+  group_by(location_name, season) |>
+  reframe(loess_peak = get_peaks(loess_smoothed, season)[,1],
+          peak_date = get_peaks(loess_smoothed, season)[,2])
+
+peak_plot <- function (given_state, given_season) {
+  flu_loess_filtered <- flu_loess |> filter(location_name == given_state, season == given_season)
+  
+  plot <- ggplot(data = flu_loess_filtered, 
+  mapping = aes(x = as.Date(date), y = weekly_rate)) +
+    geom_point(size = 0.5) +
+    geom_smooth(method = "loess", span = 0.4) +
+    theme_minimal() +
+    labs(x = "Date", y = "Weekly Rate", title = paste0("Weekly Hospitalization Rates in ", given_state, ", ", given_season))
+  return(plot)
+}
+
+lapply(seasons[2:5], peak_plot, given_state = "Virginia")
+lapply(seasons[2:5], peak_plot, given_state = "Wyoming")
+```
+
+
